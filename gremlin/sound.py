@@ -795,6 +795,13 @@ class Sound:
 
 
 
+    def _has_active_audio(self) -> bool:
+        """true if any audio stream is currently playing"""
+        if not USE_SD:
+            return False
+        with self._tasks_lock:
+            return self._active_sounds > 0 or bool(self._sound_tasks)
+
     def _update_devices(self):
         """ updates the sound devices list """
         verbose = self.verbose
@@ -803,22 +810,26 @@ class Sound:
         self.pushPlaybackEnabled()
         try:
             if self._initialized:
-                # re-init
-                # abort current playback threads
-                self.soundStop()
-                if self._sound_tasks:
-                    # there are current streams playing - stop them
-                    for task in self._sound_tasks:
-                        task.cancel()
-
-                while self._active_sounds > 0:
-                    # wait for tasks to complete
-                    time.sleep(0.1)
-
-                self._sound_tasks.clear()
-                gc.collect() # forcibly terminate any dangling streams to avoid deadlocks on sd re-init
-                sd._terminate()
-                sd._initialize()
+                # Re-initializing PortAudio tears down its global library state,
+                # including any live output stream, so it cannot run while audio
+                # is playing. Stopping playback and blocking until it drains
+                # avoids the crash but stalls the caller for as long as the
+                # current sound lasts, which is visible as input lag whenever a
+                # device lookup happens during playback. Skip the teardown in
+                # that case instead: refreshing the device list on its own is
+                # safe, and the re-initialization happens on the next lookup
+                # once nothing is playing.
+                if self._has_active_audio():
+                    if verbose:
+                        syslog.info(
+                            "AUDIO: playback in progress - skipping device re-initialization"
+                        )
+                else:
+                    self.soundStop()
+                    self._sound_tasks.clear()
+                    gc.collect() # forcibly terminate any dangling streams to avoid deadlocks on sd re-init
+                    sd._terminate()
+                    sd._initialize()
                 self.device_map.clear()
                 self.device_name_to_id_map.clear()
                 self.device_sample_rate_map.clear()
